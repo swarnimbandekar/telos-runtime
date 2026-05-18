@@ -482,8 +482,8 @@ func (d *TelosDaemon) startSocketServer() error {
 	}
 	d.listener = listener
 
-	// Set socket permissions
-	os.Chmod(d.socketPath, 0666)
+	// Set socket permissions (owner-only access for security)
+	os.Chmod(d.socketPath, 0600)
 
 	// [Phase 11: Heartbeat Watchdog]
 	go d.watchdogRoutine()
@@ -512,7 +512,7 @@ func (d *TelosDaemon) startEventsServer() error {
 		return err
 	}
 	d.eventsListener = l
-	os.Chmod(d.eventsSocketPath, 0666)
+	os.Chmod(d.eventsSocketPath, 0600)
 
 	go func() {
 		for {
@@ -647,9 +647,54 @@ func (d *TelosDaemon) acceptConnections() {
 	}
 }
 
+// getPeerCredentials extracts the UID and GID of the connecting peer
+// from a Unix domain socket connection using SO_PEERCRED.
+func getPeerCredentials(conn net.Conn) (uid uint32, gid uint32, err error) {
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		return 0, 0, fmt.Errorf("not a unix connection")
+	}
+
+	rawConn, err := unixConn.SyscallConn()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get syscall conn: %w", err)
+	}
+
+	var cred *syscall.Ucred
+	var credErr error
+	err = rawConn.Control(func(fd uintptr) {
+		cred, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("rawconn control: %w", err)
+	}
+	if credErr != nil {
+		return 0, 0, fmt.Errorf("getsockopt peercred: %w", credErr)
+	}
+
+	return uint32(cred.Uid), uint32(cred.Gid), nil
+}
+
+// isPrivilegedCommand returns true for commands that modify security-critical
+// BPF maps and should only be executable by root (UID 0).
+func isPrivilegedCommand(command string) bool {
+	switch command {
+	case "UPDATE_TAINT", "CLEAR_TAINT", "UPDATE_EXEC", "CLEAR_EXEC":
+		return true
+	default:
+		return false
+	}
+}
+
 // handleConnection processes a single socket connection
 func (d *TelosDaemon) handleConnection(conn net.Conn) {
 	defer conn.Close()
+
+	// Get peer credentials for authentication
+	peerUID, _, peerErr := getPeerCredentials(conn)
+	if peerErr != nil {
+		log.Printf("[AUTH] Failed to get peer credentials: %v", peerErr)
+	}
 
 	reader := bufio.NewReader(conn)
 
@@ -666,6 +711,16 @@ func (d *TelosDaemon) handleConnection(conn net.Conn) {
 			d.sendResponse(conn, IPCResponse{
 				Success: false,
 				Error:   "Invalid JSON: " + err.Error(),
+			})
+			continue
+		}
+
+		// Check authentication for privileged commands
+		if isPrivilegedCommand(cmd.Command) && peerErr == nil && peerUID != 0 {
+			log.Printf("[AUTH] Permission denied: UID %d attempted privileged command %s", peerUID, cmd.Command)
+			d.sendResponse(conn, IPCResponse{
+				Success: false,
+				Error:   "permission denied: only root can execute privileged commands",
 			})
 			continue
 		}

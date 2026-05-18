@@ -1,0 +1,28 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Fix IPC socket world-writable permissions and add peer credential authentication to the Go daemon's Unix socket handler. This addresses GitHub issue #25 where telos.sock and telos_events.sock are created with 0666 permissions and no authentication, allowing any unprivileged local user to send sensitive commands (UPDATE_TAINT, CLEAR_TAINT, UPDATE_EXEC, CLEAR_EXEC) that control eBPF enforcement.",
+  "status": "in_progress",
+  "steps": [
+    "Step 1: Change socket permissions in telos_core/loader/main.go. In startSocketServer(), change os.Chmod(d.socketPath, 0666) to os.Chmod(d.socketPath, 0600) so only the owner (root) can read/write. Do the same for the events socket in startEventsServer() - change os.Chmod(d.eventsSocketPath, 0666) to os.Chmod(d.eventsSocketPath, 0600).",
+    "Step 2: Add a helper function getPeerCredentials(conn net.Conn) that uses syscall.GetsockoptUcred with SO_PEERCRED to extract the UID/GID of the connecting peer from the Unix socket connection. This requires extracting the raw file descriptor from the net.UnixConn. Import 'golang.org/x/sys/unix' or use syscall directly. The function should return (uid uint32, gid uint32, err error).",
+    "Step 3: Add a function isPrivilegedCommand(command string) bool that returns true for sensitive commands: UPDATE_TAINT, CLEAR_TAINT, UPDATE_EXEC, CLEAR_EXEC. Non-sensitive commands like PING, IPC_PING, GET_STATE should return false (they are read-only or heartbeat).",
+    "Step 4: Add an authentication check in handleConnection(). After accepting the connection, call getPeerCredentials to get the peer UID. Store it on a per-connection basis (e.g. pass it to handleCommand or check before dispatching). Before processing each command in handleCommand, if isPrivilegedCommand returns true, verify that the peer UID is 0 (root). If not root, return an IPCResponse with Success=false and Error='permission denied: only root can execute privileged commands'. Log the rejected attempt with the UID and command name.",
+    "Step 5: Create Go unit tests in telos_core/loader/main_test.go. Test isPrivilegedCommand() for all command types. Test the IPC socket auth integration by creating a Unix socket server with the new auth logic, connecting as the current user (which will be root in this env), and verifying that commands are accepted. Also test that the permission check logic correctly identifies privileged vs non-privileged commands.",
+    "Step 6: Ensure the Go code compiles successfully with 'go build' in telos_core/loader/."
+  ],
+  "acceptance_criteria": [
+    "Socket files are created with 0600 permissions (only owner/root can access)",
+    "Sensitive commands (UPDATE_TAINT, CLEAR_TAINT, UPDATE_EXEC, CLEAR_EXEC) are rejected with a permission denied error when the connecting peer is not root (UID 0)",
+    "Non-sensitive commands (PING, IPC_PING, GET_STATE, REGISTER_AGENT, UPDATE_INODE, UPDATE_NETWORK, DELETE_NETWORK, ADD_MIRAGE) still work regardless of caller UID since socket perms already restrict access, but the privileged check adds defense-in-depth",
+    "Go code compiles without errors: 'go build -o /dev/null main.go'",
+    "Go unit tests pass: 'go test ./...'",
+    "The Python cortex client (unix_socket.py) does not need changes since it already connects as whatever user runs the cortex process (which should be root)"
+  ],
+  "verification": [
+    "Run 'go build -o /dev/null main.go' in telos_core/loader/ and confirm it compiles",
+    "Run 'go test -v ./...' in telos_core/loader/ and confirm all tests pass"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
