@@ -170,6 +170,10 @@ type TelosDaemon struct {
 	eventClients   map[net.Conn]struct{}
 	clientsMu      sync.Mutex
 	done           chan struct{}
+
+	// getCredentialsFunc allows injection of a custom credential retrieval
+	// function for testing. If nil, defaults to getPeerCredentials.
+	getCredentialsFunc func(net.Conn) (uint32, uint32, error)
 }
 
 // === PHASE 12: PROMETHEUS METRICS ===
@@ -503,7 +507,11 @@ func (d *TelosDaemon) startSocketServer() error {
 	return nil
 }
 
-// startEventsServer starts a separate Unix socket for streaming BPF events to the Telemetry Dashboard
+// startEventsServer starts a separate Unix socket for streaming BPF events to the Telemetry Dashboard.
+// Security note: this socket does not perform peer credential checks. It only broadcasts
+// events (read-only) and does not accept commands, so the risk is limited to information
+// disclosure. Access is restricted by 0600 file permissions which prevent non-owner access.
+// This is accepted as the socket provides observability data and carries no mutation capability.
 func (d *TelosDaemon) startEventsServer() error {
 	os.Remove(d.eventsSocketPath)
 
@@ -691,7 +699,11 @@ func (d *TelosDaemon) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// Get peer credentials for authentication
-	peerUID, _, peerErr := getPeerCredentials(conn)
+	credFunc := getPeerCredentials
+	if d.getCredentialsFunc != nil {
+		credFunc = d.getCredentialsFunc
+	}
+	peerUID, _, peerErr := credFunc(conn)
 	if peerErr != nil {
 		log.Printf("[AUTH] Failed to get peer credentials: %v", peerErr)
 	}
@@ -715,14 +727,25 @@ func (d *TelosDaemon) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		// Check authentication for privileged commands
-		if isPrivilegedCommand(cmd.Command) && peerErr == nil && peerUID != 0 {
-			log.Printf("[AUTH] Permission denied: UID %d attempted privileged command %s", peerUID, cmd.Command)
-			d.sendResponse(conn, IPCResponse{
-				Success: false,
-				Error:   "permission denied: only root can execute privileged commands",
-			})
-			continue
+		// Check authentication for privileged commands (fail-closed: deny if
+		// credentials could not be obtained OR if the peer is not root)
+		if isPrivilegedCommand(cmd.Command) {
+			if peerErr != nil {
+				log.Printf("[AUTH] Permission denied: credential lookup failed for privileged command %s: %v", cmd.Command, peerErr)
+				d.sendResponse(conn, IPCResponse{
+					Success: false,
+					Error:   "permission denied: unable to verify peer credentials",
+				})
+				continue
+			}
+			if peerUID != 0 {
+				log.Printf("[AUTH] Permission denied: UID %d attempted privileged command %s", peerUID, cmd.Command)
+				d.sendResponse(conn, IPCResponse{
+					Success: false,
+					Error:   "permission denied: only root can execute privileged commands",
+				})
+				continue
+			}
 		}
 
 		// Handle command

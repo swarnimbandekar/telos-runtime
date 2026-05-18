@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -215,5 +216,169 @@ func TestIPCSocketIntegration(t *testing.T) {
 	}
 	if resp.Success {
 		t.Error("unknown command should not succeed")
+	}
+}
+
+// TestAuthDenialForNonRoot tests that privileged commands are rejected when the
+// peer UID is not root. Uses the injectable getCredentialsFunc to simulate a
+// non-root connection without requiring a different OS user.
+func TestAuthDenialForNonRoot(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test_auth.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	// Create daemon with injected credential function returning non-root UID
+	daemon := &TelosDaemon{
+		socketPath:   sockPath,
+		listener:     listener,
+		eventClients: make(map[net.Conn]struct{}),
+		done:         make(chan struct{}),
+		getCredentialsFunc: func(conn net.Conn) (uint32, uint32, error) {
+			return 1000, 1000, nil // Simulate non-root user (UID 1000)
+		},
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go daemon.handleConnection(conn)
+		}
+	}()
+
+	clientConn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer clientConn.Close()
+
+	reader := bufio.NewReader(clientConn)
+
+	// Non-privileged command should succeed regardless of UID
+	cmd := IPCCommand{Command: "PING"}
+	data, _ := json.Marshal(cmd)
+	data = append(data, '\n')
+	clientConn.Write(data)
+
+	respLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("failed to read PING response: %v", err)
+	}
+	var resp IPCResponse
+	if err := json.Unmarshal(respLine, &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if !resp.Success {
+		t.Errorf("PING should succeed for non-root user, got error: %s", resp.Error)
+	}
+
+	// Privileged command should be denied for non-root UID
+	privilegedCmds := []string{"UPDATE_TAINT", "CLEAR_TAINT", "UPDATE_EXEC", "CLEAR_EXEC"}
+	for _, cmdName := range privilegedCmds {
+		cmd = IPCCommand{Command: cmdName}
+		data, _ = json.Marshal(cmd)
+		data = append(data, '\n')
+		clientConn.Write(data)
+
+		respLine, err = reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("failed to read %s response: %v", cmdName, err)
+		}
+		if err := json.Unmarshal(respLine, &resp); err != nil {
+			t.Fatalf("failed to unmarshal %s response: %v", cmdName, err)
+		}
+		if resp.Success {
+			t.Errorf("%s should be denied for non-root user", cmdName)
+		}
+		if resp.Error != "permission denied: only root can execute privileged commands" {
+			t.Errorf("%s: unexpected error message: %s", cmdName, resp.Error)
+		}
+	}
+}
+
+// TestAuthDenialOnCredentialError tests that privileged commands are rejected
+// when credential retrieval fails (fail-closed behavior).
+func TestAuthDenialOnCredentialError(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test_auth_err.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	// Create daemon with injected credential function that returns an error
+	daemon := &TelosDaemon{
+		socketPath:   sockPath,
+		listener:     listener,
+		eventClients: make(map[net.Conn]struct{}),
+		done:         make(chan struct{}),
+		getCredentialsFunc: func(conn net.Conn) (uint32, uint32, error) {
+			return 0, 0, errors.New("simulated credential lookup failure")
+		},
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go daemon.handleConnection(conn)
+		}
+	}()
+
+	clientConn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer clientConn.Close()
+
+	reader := bufio.NewReader(clientConn)
+
+	// Non-privileged command should still succeed even with credential error
+	cmd := IPCCommand{Command: "PING"}
+	data, _ := json.Marshal(cmd)
+	data = append(data, '\n')
+	clientConn.Write(data)
+
+	respLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("failed to read PING response: %v", err)
+	}
+	var resp IPCResponse
+	if err := json.Unmarshal(respLine, &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if !resp.Success {
+		t.Errorf("PING should succeed even when credentials fail, got error: %s", resp.Error)
+	}
+
+	// Privileged command should be denied when credentials cannot be obtained
+	cmd = IPCCommand{Command: "UPDATE_TAINT"}
+	data, _ = json.Marshal(cmd)
+	data = append(data, '\n')
+	clientConn.Write(data)
+
+	respLine, err = reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("failed to read UPDATE_TAINT response: %v", err)
+	}
+	if err := json.Unmarshal(respLine, &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Success {
+		t.Error("UPDATE_TAINT should be denied when credential lookup fails")
+	}
+	if resp.Error != "permission denied: unable to verify peer credentials" {
+		t.Errorf("unexpected error message: %s", resp.Error)
 	}
 }
