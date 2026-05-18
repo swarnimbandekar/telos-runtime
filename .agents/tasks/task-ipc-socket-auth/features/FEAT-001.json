@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "fix",
   "description": "Fix IPC socket world-writable permissions and add peer credential authentication to the Go daemon's Unix socket handler. This addresses GitHub issue #25 where telos.sock and telos_events.sock are created with 0666 permissions and no authentication, allowing any unprivileged local user to send sensitive commands (UPDATE_TAINT, CLEAR_TAINT, UPDATE_EXEC, CLEAR_EXEC) that control eBPF enforcement.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "Step 1: Change socket permissions in telos_core/loader/main.go. In startSocketServer(), change os.Chmod(d.socketPath, 0666) to os.Chmod(d.socketPath, 0600) so only the owner (root) can read/write. Do the same for the events socket in startEventsServer() - change os.Chmod(d.eventsSocketPath, 0666) to os.Chmod(d.eventsSocketPath, 0600).",
     "Step 2: Add a helper function getPeerCredentials(conn net.Conn) that uses syscall.GetsockoptUcred with SO_PEERCRED to extract the UID/GID of the connecting peer from the Unix socket connection. This requires extracting the raw file descriptor from the net.UnixConn. Import 'golang.org/x/sys/unix' or use syscall directly. The function should return (uid uint32, gid uint32, err error).",
@@ -24,5 +24,5 @@
     "Run 'go test -v ./...' in telos_core/loader/ and confirm all tests pass"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "Implementation complete. Used syscall.GetsockoptUcred via SyscallConn().Control() for peer credential extraction. BPF map commands cannot be fully integration-tested without kernel support, so the integration test verifies auth layer behavior with PING and unknown commands. All 4 tests pass. Build succeeds."
 }
